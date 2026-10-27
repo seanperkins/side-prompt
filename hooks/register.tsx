@@ -1,7 +1,10 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { CommandInfo, EngineInterface, Register } from 'claude-code'
 
 import { AFFIRMATIONS } from './affirmations'
+import { btwRows, fieldColumns, promptRows, submitLabelFor } from './fit'
+import { parseSlash, resolveCommand, slashHint } from './slash'
+import type { SlashCommand } from './slash'
 
 const PANE = 'side-prompt'
 // The `$.store` key that remembers the pane was open when the session ended.
@@ -20,11 +23,17 @@ const tab = atom({ plugin: 'side-prompt', key: 'tab' } as const, 'prompt')
 
 const TABS = ['prompt', 'btw'] as const
 
+// Shortest first; `submitLabelFor` picks the one that leaves the field the most room.
+const PROMPT_LABELS = ['send', 'send prompt', 'send · esc to main'] as const
+const BTW_LABELS = ['ask', 'ask Claude', 'ask · esc to main'] as const
+
 const NO_ANSWER: Record<string, string> = {
   'nothing-to-fork': 'Nothing to ask about yet: send a prompt first (or you just ran /clear).',
   'empty-reply': 'The model sent back nothing.',
   aborted: 'The question was interrupted.',
 }
+
+const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
 const openPane = async ($: EngineInterface, options: { focus?: true } = {}) => {
   const opened = await $.ui.open({ id: PANE, title: 'Side prompt', columns: 52, ...options })
@@ -50,8 +59,121 @@ const pressSide = async ($: EngineInterface) => {
       $.ui.toast(`side pane: ${String(opened.reason)}`)
     }
   } catch (error) {
-    $.ui.toast(`side pane: ${error instanceof Error ? error.message : String(error)}`)
+    $.ui.toast(`side pane: ${messageOf(error)}`)
   }
+}
+
+const selectTab = async ($: EngineInterface, name: (typeof TABS)[number]) => {
+  await update($, tab, () => name)
+  // Put the cursor in the new tab's field so the person can type at once.
+  // Best effort: the keyboard is the person's to give, so a refusal (a
+  // draft in the main prompt box keeps it) leaves the cursor where it is.
+  try {
+    // A click on a tab presses it without giving the pane the keyboard, so
+    // ask for it first (granted only while the main prompt box is empty).
+    await openPane($, { focus: true })
+    // Waits for the field the next drawing brings.
+    await $.ui.focus({ requestId: PANE, key: name })
+  } catch {
+    // Nothing to mend: the tab has switched, only the cursor stayed put.
+  }
+}
+
+// A slash command runs as the person's own would, once Claude is idle. A
+// failure gives the draft back so it can be fixed and sent again.
+const runCommand = async ($: EngineInterface, command: CommandInfo, typed: SlashCommand, text: string) => {
+  await update($, prompt, () => '')
+  await update($, note, () => `/${command.name} queued; it runs when Claude is idle.`)
+  try {
+    await $.command.run({ command: command.name, args: typed.args })
+    await update($, note, () => '')
+  } catch (error) {
+    await update($, prompt, () => text)
+    await update($, note, () => `/${command.name} failed: ${messageOf(error)}`)
+  }
+}
+
+// The engine refuses a plugin's prompt whose text starts with `/` (it would
+// run a command as the person), so such a draft runs as a command or stays.
+const sendCommand = async ($: EngineInterface, text: string) => {
+  const typed = parseSlash(text)
+  const command = typed === undefined ? undefined : resolveCommand(typed.name, await $.command.list())
+  if (typed === undefined || command === undefined) {
+    const [first = ''] = text.trim().split(/\s/)
+    await update($, note, () => `No command ${first}. Text that starts with / can only run a command.`)
+
+    return
+  }
+  await runCommand($, command, typed, text)
+}
+
+const sendPrompt = async ($: EngineInterface, text: string) => {
+  if (text.trim() === '') {
+    return
+  }
+  if (text.trimStart().startsWith('/')) {
+    await sendCommand($, text)
+
+    return
+  }
+  await update($, prompt, () => '')
+  await update($, note, () => 'Prompt queued; it sends when Claude is idle.')
+  try {
+    await $.prompt.submit({ text, asUser: true })
+    await update($, note, () => '')
+  } catch (error) {
+    await update($, prompt, () => text)
+    await update($, note, () => `Not sent: ${messageOf(error)}`)
+  }
+}
+
+const askBtw = async ($: EngineInterface, text: string) => {
+  if (text.trim() === '') {
+    return
+  }
+  const fail = async (why: string) => {
+    await update($, note, () => why)
+    $.ui.toast(`btw: ${why}`)
+  }
+  await update($, btw, () => '')
+  await update($, note, () => 'Asking...')
+  const startedAt = await $.clock.now()
+  try {
+    const reply = await $.model.fork({ prompt: text })
+    if (reply.isAnswered) {
+      const took = `${(((await $.clock.now()) - startedAt) / 1000).toFixed(1)}s`
+      await update($, answer, () => reply.text)
+      await update($, note, () => '')
+      $.ui.toast(`btw answered (${took})`)
+    } else {
+      await fail(
+        reply.reason === 'api-error'
+          ? `API error${reply.status === null ? '' : ` ${reply.status}`}.`
+          : (NO_ANSWER[reply.reason] ?? reply.reason),
+      )
+    }
+  } catch (error) {
+    await fail(`Question failed: ${messageOf(error)}`)
+  }
+}
+
+// Editing the draft retires the last note, so the row under the field can
+// show the slash-command hint for the new one.
+const editPrompt = async ($: EngineInterface, text: string) => {
+  await update($, prompt, () => text)
+  if ((await read($, note)) !== '') {
+    await update($, note, () => '')
+  }
+}
+
+// The row under the prompt field: the latest note, or while the draft is a
+// slash command, the commands it could be.
+const promptFooter = async ($: EngineInterface, text: string, noteText: string) => {
+  if (noteText !== '' || !text.startsWith('/')) {
+    return noteText
+  }
+
+  return slashHint(text, await $.command.list()) ?? ''
 }
 
 export const register: Register = on => {
@@ -158,101 +280,63 @@ export const register: Register = on => {
       read($, affirmationAt),
       read($, tab),
     ])
-
-    const selectTab = async (name: (typeof TABS)[number]) => {
-      await update($, tab, () => name)
-      // Put the cursor in the new tab's field so the person can type at once.
-      // Best effort: the keyboard is the person's to give, so a refusal (a
-      // draft in the main prompt box keeps it) leaves the cursor where it is.
-      try {
-        // A click on a tab presses it without giving the pane the keyboard, so
-        // ask for it first (granted only while the main prompt box is empty).
-        await openPane($, { focus: true })
-        // Waits for the field the next drawing brings.
-        await $.ui.focus({ requestId: PANE, key: name })
-      } catch {
-        // Nothing to mend: the tab has switched, only the cursor stayed put.
-      }
-    }
-
-    const sendPrompt = async (text: string) => {
-      if (text.trim() === '') {
-        return
-      }
-      await update($, prompt, () => '')
-      await update($, note, () => 'Prompt queued; it sends when Claude is idle.')
-      await $.prompt.submit({ text, asUser: true })
-      await update($, note, () => '')
-    }
-
-    const askBtw = async (text: string) => {
-      if (text.trim() === '') {
-        return
-      }
-      const fail = async (why: string) => {
-        await update($, note, () => why)
-        $.ui.toast(`btw: ${why}`)
-      }
-      await update($, btw, () => '')
-      await update($, note, () => 'Asking...')
-      const startedAt = await $.clock.now()
-      try {
-        const reply = await $.model.fork({ prompt: text })
-        if (reply.isAnswered) {
-          const took = `${(((await $.clock.now()) - startedAt) / 1000).toFixed(1)}s`
-          await update($, answer, () => reply.text)
-          await update($, note, () => '')
-          $.ui.toast(`btw answered (${took})`)
-        } else {
-          await fail(
-            reply.reason === 'api-error'
-              ? `API error${reply.status === null ? '' : ` ${reply.status}`}.`
-              : (NO_ANSWER[reply.reason] ?? reply.reason),
-          )
-        }
-      } catch (error) {
-        await fail(`Question failed: ${error instanceof Error ? error.message : String(error)}`)
-      }
-    }
+    const { bodyColumns, placement, scroll } = e.props
+    const promptLabel = submitLabelFor(bodyColumns, PROMPT_LABELS)
+    const btwLabel = submitLabelFor(bodyColumns, BTW_LABELS)
+    const footer = activeTab === 'prompt' ? await promptFooter($, promptText, noteText) : noteText
 
     return (
       <Box flexDirection="column">
-        <Text italic>{AFFIRMATIONS[affirmation % AFFIRMATIONS.length] ?? ''}</Text>
-        <Text dimColor>Enter sends. Esc returns to the main prompt.</Text>
-        {isBusy && <Text dimColor>Claude is working...</Text>}
-        <Box gap={1}>
-          {TABS.map(name => (
-            <Button
-              key={`tab-${name}`}
-              label={name === activeTab ? `▸ ${name}` : name}
-              onPress={() => void selectTab(name)}
-            />
-          ))}
+        <Text italic wrap="truncate-end">
+          {AFFIRMATIONS[affirmation % AFFIRMATIONS.length] ?? ''}
+        </Text>
+        <Box justifyContent="space-between">
+          <Box gap={1} flexShrink={0}>
+            {TABS.map(name => (
+              <Button
+                key={`tab-${name}`}
+                label={name === activeTab ? `▸ ${name}` : name}
+                onPress={() => void selectTab($, name)}
+              />
+            ))}
+          </Box>
+          <Text dimColor wrap="truncate-end">
+            {isBusy ? 'Claude is working...' : 'esc: main prompt'}
+          </Text>
         </Box>
         {activeTab === 'prompt' ? (
           <Input
             key="prompt"
             placeholder="Type here while you scroll"
-            rows={5}
+            rows={promptRows(promptText, {
+              placement,
+              bodyRows: scroll.bodyRows,
+              columns: fieldColumns(bodyColumns, promptLabel),
+            })}
             autoFocus
-            submitLabel="send"
+            submitLabel={promptLabel}
             value={promptText}
-            onInput={value => void update($, prompt, () => value)}
-            onSubmit={value => void sendPrompt(value)}
+            onInput={value => void editPrompt($, value)}
+            onSubmit={value => void sendPrompt($, value)}
           />
         ) : (
           <Input
             key="btw"
             placeholder="Side question about this session"
+            rows={btwRows(btwText, { bodyRows: scroll.bodyRows, columns: fieldColumns(bodyColumns, btwLabel) })}
             autoFocus
-            submitLabel="ask"
+            submitLabel={btwLabel}
             value={btwText}
             onInput={value => void update($, btw, () => value)}
-            onSubmit={value => void askBtw(value)}
+            onSubmit={value => void askBtw($, value)}
           />
         )}
-        {noteText !== '' && <Text dimColor>{noteText}</Text>}
-        {answerText !== '' && (
+        {footer !== '' && (
+          <Text dimColor wrap="truncate-end">
+            {footer}
+          </Text>
+        )}
+        {activeTab === 'btw' && answerText !== '' && (
           <Box flexDirection="column">
             <Box borderStyle="round" paddingX={1}>
               <Markdown text={answerText} />
